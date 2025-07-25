@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body, Query
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
@@ -11,11 +11,26 @@ import traceback
 import io
 import base64
 import matplotlib.pyplot as plt
+from fastapi.middleware.cors import CORSMiddleware
+import logging
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Cargar variables desde datos.env
 load_dotenv("../datos.env")
 
 app = FastAPI()
+
+# Configuración de CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Cambia esto a tu dominio en producción
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Modelo para entrada de predicción, agregamos opción para graficar
 class EntradaPrediccion(BaseModel):
@@ -37,15 +52,6 @@ def obtener_datos(eliminar_id=True):
         mongo_password = os.getenv("MONGO_PASSWORD")
         mongo_auth_db = os.getenv("MONGO_AUTH_DB", "admin")
 
-        # Configuración SSH comentada para uso futuro
-        # ssh_host = os.getenv("SSH_HOST")
-        # ssh_port = int(os.getenv("SSH_PORT"))
-        # ssh_user = os.getenv("SSH_USER")
-        # ssh_password = os.getenv("SSH_PASSWORD")
-        # remote_bind_host = os.getenv("REMOTE_BIND_HOST")
-        # remote_bind_port = int(os.getenv("REMOTE_BIND_PORT"))
-        # local_bind_port = int(os.getenv("LOCAL_BIND_PORT"))
-
         if not all([mongo_db, mongo_collection]):
             raise ValueError("Faltan variables de entorno necesarias.")
 
@@ -60,7 +66,27 @@ def obtener_datos(eliminar_id=True):
         db = client[mongo_db]
         collection = db[mongo_collection]
 
-        datos = list(collection.find().limit(limite))
+        # Contar total de documentos
+        total_docs = collection.count_documents({})
+        logger.info(f"Total de documentos en la colección: {total_docs}")
+
+        # Obtener documentos ordenados por fecha (más recientes primero)
+        datos = list(collection.find().sort("fecha", -1).limit(limite))
+        logger.info(f"Documentos obtenidos: {len(datos)}")
+        
+        if datos:
+            # Mostrar información sobre el rango de fechas
+            fechas = [doc.get('fecha') for doc in datos if 'fecha' in doc]
+            if fechas:
+                fechas.sort()
+                logger.info(f"Rango de fechas: {fechas[0]} a {fechas[-1]}")
+            
+            # Mostrar campos disponibles en los primeros documentos
+            campos_disponibles = set()
+            for doc in datos[:5]:  # Primeros 5 documentos
+                campos_disponibles.update(doc.keys())
+            logger.info(f"Campos disponibles en los datos: {list(campos_disponibles)}")
+
         df = pd.DataFrame(datos)
 
         if eliminar_id and "_id" in df.columns:
@@ -253,3 +279,266 @@ def predecir(data: EntradaPrediccion):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error en la predicción: {str(e)}")
+
+# --- NUEVA FUNCIÓN GENERALIZADA DE PREDICCIÓN POR CAMPO ---
+def predecir_campo(nombre_campo, horas_a_predecir, graficar=False):
+    try:
+        logger.info(f"Iniciando predicción para campo: {nombre_campo}")
+        df = obtener_datos(eliminar_id=True)
+        
+        if df.empty:
+            logger.error("DataFrame vacío obtenido de la base de datos")
+            raise HTTPException(status_code=500, detail="No se pudieron obtener datos.")
+
+        logger.info(f"Columnas originales en DataFrame: {list(df.columns)}")
+        logger.info(f"Primeras filas del DataFrame: {df.head().to_dict()}")
+
+        # Mapear campo del frontend al campo real de la BD
+        campo_real = nombre_campo
+        
+        # Filtrar solo registros con la estructura correcta (ignorar registros con campo 'valor')
+        campos_esperados = ['humedadSuelo', 'temperaturaBME', 'humedadAire', 'lluvia', 'presion', 'luminosidad']
+        df_filtrado = df[df.columns.intersection(campos_esperados + ['fecha', '__v'])]
+        
+        # Eliminar registros que solo tengan 'valor' (datos antiguos de prueba)
+        if 'valor' in df.columns:
+            df_filtrado = df_filtrado.drop(columns=['valor'], errors='ignore')
+            logger.info("Eliminando registros con campo 'valor' (datos antiguos de prueba)")
+        
+        if campo_real not in df_filtrado.columns:
+            logger.error(f"Columna '{campo_real}' no encontrada en datos recientes. Columnas disponibles: {list(df_filtrado.columns)}")
+            raise HTTPException(status_code=500, detail=f"Columna '{campo_real}' no encontrada en los datos recientes.")
+        
+        # Usar el DataFrame filtrado
+        df = df_filtrado
+        logger.info(f"Usando DataFrame filtrado con columnas: {list(df.columns)}")
+
+        if "fecha" not in df.columns:
+            logger.error(f"Columna 'fecha' no encontrada. Columnas disponibles: {list(df.columns)}")
+            raise HTTPException(status_code=500, detail="Columna 'fecha' no encontrada en los datos.")
+
+        # Convertir columna fecha a datetime y limpiar filas inválidas
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+        df = df.dropna(subset=["fecha"])
+        
+        if df.empty:
+            logger.error("No quedaron datos válidos después de limpiar fechas")
+            raise HTTPException(status_code=500, detail="No hay datos válidos para predicción.")
+
+        # Ordenar por fecha (más recientes primero)
+        df = df.sort_values('fecha', ascending=False)
+
+        # Imputar valores faltantes de la columna a predecir usando la mediana de los valores existentes
+        if df[campo_real].isnull().any():
+            mediana = df[campo_real].median()
+            logger.info(f"Imputando valores faltantes en '{campo_real}' usando la mediana: {mediana}")
+            df[campo_real] = df[campo_real].fillna(mediana)
+
+        # Eliminar filas que aún tengan NaN en la columna a predecir (por si la mediana no se pudo calcular)
+        df = df.dropna(subset=[campo_real])
+        if df.empty:
+            logger.error("No hay datos válidos para predicción después de imputar valores")
+            raise HTTPException(status_code=500, detail="No hay datos válidos para predicción.")
+
+        logger.info(f"Datos válidos después de limpieza e imputación: {len(df)} filas")
+
+        # Establecer fecha como índice para usar resample
+        df = df.set_index("fecha")
+        df = df.resample("H").mean()
+        df = df.dropna(subset=[campo_real])
+        if df.empty:
+            logger.error("No quedaron datos después del resample por hora")
+            raise HTTPException(status_code=500, detail="No hay suficientes datos para predicción.")
+        logger.info(f"Datos después de resample: {len(df)} filas")
+
+        # Ordenar por fecha (más antiguos primero para el modelo)
+        df = df.sort_index()
+
+        df["hora"] = np.arange(len(df))
+        X = df[["hora"]]
+        y = df[campo_real]
+
+        modelo = LinearRegression()
+        modelo.fit(X, y)
+
+        if horas_a_predecir <= 0:
+            raise HTTPException(status_code=400, detail="horas_a_predecir debe ser mayor que 0.")
+
+        horas_futuras = np.arange(len(df), len(df) + horas_a_predecir).reshape(-1, 1)
+        predicciones = modelo.predict(horas_futuras)
+
+        resultados = []
+        for hora, pred in zip(horas_futuras.flatten(), predicciones):
+            try:
+                if pd.isna(pred) or np.isinf(pred) or abs(pred) > 1e308:
+                    pred_valor = None
+                else:
+                    pred_valor = float(pred)
+                    
+                    # Normalizar valores según el tipo de campo
+                    if nombre_campo == 'temperaturaBME':
+                        # Temperatura entre 20-40°C
+                        pred_valor = max(20, min(40, pred_valor))
+                    elif nombre_campo == 'humedadAire':
+                        # Humedad entre 30-90%
+                        pred_valor = max(30, min(90, pred_valor))
+                    elif nombre_campo == 'lluvia':
+                        # Lluvia entre 0-50mm
+                        pred_valor = max(0, min(50, pred_valor))
+                    elif nombre_campo == 'humedadSuelo':
+                        # Humedad suelo entre 20-80%
+                        pred_valor = max(20, min(80, pred_valor))
+                
+                # Calcular fecha para el día
+                fecha_prediccion = df.index[-1] + pd.Timedelta(hours=int(hora) - len(df))
+                dia = fecha_prediccion.strftime('%Y-%m-%d')
+                
+                resultados.append({
+                    "hora_futura": int(hora),
+                    "prediccion_valor": pred_valor,
+                    "predicted": pred_valor,  # Campo que espera el frontend
+                    "day": dia,  # Campo que espera el frontend
+                    "actual": None  # Campo que espera el frontend
+                })
+            except Exception as e:
+                logger.warning(f"Error procesando predicción: {e}")
+                resultados.append({
+                    "hora_futura": int(hora),
+                    "prediccion_valor": None,
+                    "predicted": None,
+                    "day": None,
+                    "actual": None
+                })
+
+        respuesta = {"predictions": resultados}
+        logger.info(f"Predicción completada exitosamente para {nombre_campo}")
+
+        if graficar:
+            try:
+                plt.figure(figsize=(10, 5))
+                plt.plot(df.index, y, label="Datos históricos")
+                fechas_futuras = pd.date_range(start=df.index[-1], periods=horas_a_predecir + 1, freq="H")[1:]
+                plt.plot(fechas_futuras, predicciones, label="Predicción", linestyle="--")
+                plt.title(f"Predicción de {nombre_campo}")
+                plt.xlabel("Fecha")
+                plt.ylabel(nombre_campo)
+                plt.legend()
+                plt.grid(True)
+                buffer = io.BytesIO()
+                plt.savefig(buffer, format="png")
+                buffer.seek(0)
+                imagen_base64 = base64.b64encode(buffer.read()).decode("utf-8")
+                buffer.close()
+                plt.close()
+                respuesta["grafica"] = imagen_base64
+            except Exception as e:
+                logger.error(f"Error generando gráfica: {e}")
+
+        return respuesta
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error inesperado en predecir_campo: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error interno en predicción: {str(e)}")
+
+# --- RUTAS DE PREDICCIÓN PARA EL FRONTEND ---
+from fastapi import Body
+
+@app.api_route("/predictions/temperature", methods=["GET", "POST", "OPTIONS"])
+def predict_temperature(
+    days: int = Query(7, description="Número de días a predecir"),
+    payload: dict = Body(None)
+):
+    try:
+        if payload:
+            # POST request
+            horas = payload.get("hours_to_predict", 168)
+            graficar = payload.get("include_graph", False)
+        else:
+            # GET request
+            horas = days * 24
+            graficar = False
+        return predecir_campo("temperaturaBME", horas, graficar)
+    except Exception as e:
+        logger.error(f"Error en predict_temperature: {e}")
+        raise
+
+@app.api_route("/predictions/humidity", methods=["GET", "POST", "OPTIONS"])
+def predict_humidity(
+    days: int = Query(7, description="Número de días a predecir"),
+    payload: dict = Body(None)
+):
+    try:
+        if payload:
+            # POST request
+            horas = payload.get("hours_to_predict", 168)
+            graficar = payload.get("include_graph", False)
+        else:
+            # GET request
+            horas = days * 24
+            graficar = False
+        return predecir_campo("humedadAire", horas, graficar)
+    except Exception as e:
+        logger.error(f"Error en predict_humidity: {e}")
+        raise
+
+@app.api_route("/predictions/rainfall", methods=["GET", "POST", "OPTIONS"])
+def predict_rainfall(
+    days: int = Query(7, description="Número de días a predecir"),
+    payload: dict = Body(None)
+):
+    try:
+        if payload:
+            # POST request
+            horas = payload.get("hours_to_predict", 168)
+            graficar = payload.get("include_graph", False)
+        else:
+            # GET request
+            horas = days * 24
+            graficar = False
+        return predecir_campo("lluvia", horas, graficar)
+    except Exception as e:
+        logger.error(f"Error en predict_rainfall: {e}")
+        raise
+
+@app.api_route("/predictions/soil-moisture", methods=["GET", "POST", "OPTIONS"])
+def predict_soil_moisture(
+    days: int = Query(7, description="Número de días a predecir"),
+    payload: dict = Body(None)
+):
+    try:
+        if payload:
+            # POST request
+            horas = payload.get("hours_to_predict", 168)
+            graficar = payload.get("include_graph", False)
+        else:
+            # GET request
+            horas = days * 24
+            graficar = False
+        return predecir_campo("humedadSuelo", horas, graficar)
+    except Exception as e:
+        logger.error(f"Error en predict_soil_moisture: {e}")
+        raise
+
+# Ruta de ejemplo para /predictions/alerts
+@app.get("/predictions/alerts")
+def get_alerts():
+    # Ejemplo de alerta, puedes personalizar la lógica
+    return {
+        "alerts": [
+            {
+                "type": "temperature",
+                "severity": "warning",
+                "message": "Temperatura alta prevista para los próximos días.",
+                "recommendation": "Aumentar riego y sombra."
+            },
+            {
+                "type": "general",
+                "severity": "info",
+                "message": "Condiciones favorables para el cultivo de cacao.",
+                "recommendation": "Mantener monitoreo regular."
+            }
+        ]
+    }
