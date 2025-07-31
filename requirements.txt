@@ -1,8 +1,10 @@
 fastapi
 uvicorn
-pymongo
+pymongo>=4.9,<4.10
 sshtunnel
 scikit-learn
 pandas
 python-dotenv
 matplotlib
+motor==3.6.1
+pydantic-settings
