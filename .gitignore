@@ -1,2 +1,3 @@
 msa-venv/
 .venv/*
+datos.env
