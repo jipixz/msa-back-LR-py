@@ -8,3 +8,4 @@ python-dotenv
 matplotlib
 motor==3.6.1
 pydantic-settings
+lru_cache
