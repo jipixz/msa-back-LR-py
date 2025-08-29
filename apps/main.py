@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Body, Query, Path
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
@@ -41,13 +41,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Modelo para entrada de predicción, agregamos opción para graficar
+# Modelo para entrada de predicción, agregamos opción para graficar y nodo
 class EntradaPrediccion(BaseModel):
     horas_a_predecir: int
     graficar: bool = False
+    nodo: int = None  # Nuevo campo para especificar nodo (0-3)
+
+# Modelo para predicción por nodo
+class EntradaPrediccionNodo(BaseModel):
+    horas_a_predecir: int
+    graficar: bool = False
+    nodo: int = 0  # Nodo específico (0-3)
 
 # Función para conectarse y obtener los datos
-def obtener_datos(eliminar_id=True):
+def obtener_datos(eliminar_id=True, nodo=None):
     try:
         # Configuración para conexión local
         mongo_host = os.getenv("MONGO_HOST", "localhost")
@@ -79,8 +86,14 @@ def obtener_datos(eliminar_id=True):
         total_docs = collection.count_documents({})
         logger.info(f"Total de documentos en la colección: {total_docs}")
 
+        # Construir filtro de consulta
+        filtro = {}
+        if nodo is not None:
+            filtro["nodo"] = nodo
+            logger.info(f"Filtrando datos por nodo: {nodo}")
+        
         # Obtener documentos ordenados por fecha (más recientes primero)
-        datos = list(collection.find().sort("fecha", -1).limit(limite))
+        datos = list(collection.find(filtro).sort("fecha", -1).limit(limite))
         logger.info(f"Documentos obtenidos: {len(datos)}")
         
         if datos:
@@ -331,6 +344,13 @@ def get_datos():
 # --- Ruta POST para predecir ---
 @app.post("/predecir")
 def predecir(data: EntradaPrediccion):
+    # Si se especifica un nodo, usar la función específica por nodo
+    if data.nodo is not None:
+        print("Predicción por nodo")
+        return predecir_por_nodo(data)
+    
+    # Predicción general (todos los nodos)
+    print("Predicción general")
     try:
         df = obtener_datos(eliminar_id=True)
         if df.empty:
@@ -412,13 +432,33 @@ def predecir(data: EntradaPrediccion):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error en la predicción: {str(e)}")
 
+# --- FUNCIÓN PARA PREDICCIÓN POR NODO ---
+def predecir_por_nodo(data: EntradaPrediccion):
+    """Realiza predicciones específicas para un nodo determinado"""
+    try:
+        logger.info(f"Iniciando predicción para nodo: {data.nodo}")
+        
+        # Obtener datos específicos del nodo
+        df = obtener_datos(eliminar_id=True, nodo=data.nodo)
+        
+        if df.empty:
+            raise HTTPException(status_code=500, detail=f"No se pudieron obtener datos para el nodo {data.nodo}.")
+
+        # Usar la función generalizada de predicción por campo
+        # Por defecto, predecir temperatura para el nodo específico
+        return predecir_campo("temperaturaBME", data.horas_a_predecir, data.graficar, data.nodo)
+        
+    except Exception as e:
+        logger.error(f"Error en predicción por nodo: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en la predicción por nodo: {str(e)}")
+
 # --- NUEVA FUNCIÓN GENERALIZADA DE PREDICCIÓN POR CAMPO ---
-def predecir_campo(nombre_campo, horas_a_predecir, graficar=False):
+def predecir_campo(nombre_campo, horas_a_predecir, graficar=False, nodo=None):
     try:
         logger.info(f"Iniciando predicción para campo: {nombre_campo}")
         
         # Verificar cache primero
-        cache_key = get_cache_key(nombre_campo, horas_a_predecir, graficar)
+        cache_key = get_cache_key(f"{nombre_campo}_nodo_{nodo}", horas_a_predecir, graficar) if nodo is not None else get_cache_key(nombre_campo, horas_a_predecir, graficar)
         cached_result = get_cached_prediction(cache_key)
         
         if cached_result:
@@ -426,7 +466,7 @@ def predecir_campo(nombre_campo, horas_a_predecir, graficar=False):
             return cached_result
         
         # Si no hay cache, generar nueva predicción
-        df = obtener_datos(eliminar_id=True)
+        df = obtener_datos(eliminar_id=True, nodo=nodo)
         
         if df.empty:
             logger.error("DataFrame vacío obtenido de la base de datos")
@@ -746,6 +786,135 @@ def predict_soil_moisture(
         return predecir_campo("humedadSuelo", horas, graficar)
     except Exception as e:
         logger.error(f"Error en predict_soil_moisture: {e}")
+        raise
+
+# --- NUEVOS ENDPOINTS PARA PREDICCIONES POR NODO ---
+
+@app.api_route("/predictions/node/{nodo}/temperature", methods=["GET", "POST", "OPTIONS"])
+def predict_node_temperature(
+    nodo: int = Path(..., description="ID del nodo (0-3)"),
+    days: int = Query(7, description="Número de días a predecir"),
+    payload: dict = Body(None)
+):
+    try:
+        if not 0 <= nodo <= 3:
+            raise HTTPException(status_code=400, detail="El nodo debe estar entre 0 y 3")
+        
+        if payload:
+            horas = payload.get("hours_to_predict", 168)
+            graficar = payload.get("include_graph", False)
+        else:
+            horas = days * 24
+            graficar = False
+        
+        return predecir_campo("temperaturaBME", horas, graficar, nodo)
+    except Exception as e:
+        logger.error(f"Error en predict_node_temperature para nodo {nodo}: {e}")
+        raise
+
+@app.api_route("/predictions/node/{nodo}/humidity", methods=["GET", "POST", "OPTIONS"])
+def predict_node_humidity(
+    nodo: int = Path(..., description="ID del nodo (0-3)"),
+    days: int = Query(7, description="Número de días a predecir"),
+    payload: dict = Body(None)
+):
+    try:
+        if not 0 <= nodo <= 3:
+            raise HTTPException(status_code=400, detail="El nodo debe estar entre 0 y 3")
+        
+        if payload:
+            horas = payload.get("hours_to_predict", 168)
+            graficar = payload.get("include_graph", False)
+        else:
+            horas = days * 24
+            graficar = False
+        
+        return predecir_campo("humedadAire", horas, graficar, nodo)
+    except Exception as e:
+        logger.error(f"Error en predict_node_humidity para nodo {nodo}: {e}")
+        raise
+
+@app.api_route("/predictions/node/{nodo}/rainfall", methods=["GET", "POST", "OPTIONS"])
+def predict_node_rainfall(
+    nodo: int = Path(..., description="ID del nodo (0-3)"),
+    days: int = Query(7, description="Número de días a predecir"),
+    payload: dict = Body(None)
+):
+    try:
+        if not 0 <= nodo <= 3:
+            raise HTTPException(status_code=400, detail="El nodo debe estar entre 0 y 3")
+        
+        if payload:
+            horas = payload.get("hours_to_predict", 168)
+            graficar = payload.get("include_graph", False)
+        else:
+            horas = days * 24
+            graficar = False
+        
+        return predecir_campo("lluvia", horas, graficar, nodo)
+    except Exception as e:
+        logger.error(f"Error en predict_node_rainfall para nodo {nodo}: {e}")
+        raise
+
+@app.api_route("/predictions/node/{nodo}/soil-moisture", methods=["GET", "POST", "OPTIONS"])
+def predict_node_soil_moisture(
+    nodo: int = Path(..., description="ID del nodo (0-3)"),
+    days: int = Query(7, description="Número de días a predecir"),
+    payload: dict = Body(None)
+):
+    try:
+        if not 0 <= nodo <= 3:
+            raise HTTPException(status_code=400, detail="El nodo debe estar entre 0 y 3")
+        
+        if payload:
+            horas = payload.get("hours_to_predict", 168)
+            graficar = payload.get("include_graph", False)
+        else:
+            horas = days * 24
+            graficar = False
+        
+        return predecir_campo("humedadSuelo", horas, graficar, nodo)
+    except Exception as e:
+        logger.error(f"Error en predict_node_soil_moisture para nodo {nodo}: {e}")
+        raise
+
+@app.api_route("/predictions/node/{nodo}/all", methods=["GET", "POST", "OPTIONS"])
+def predict_node_all(
+    nodo: int = Path(..., description="ID del nodo (0-3)"),
+    days: int = Query(7, description="Número de días a predecir"),
+    payload: dict = Body(None)
+):
+    """Predice todas las variables para un nodo específico"""
+    try:
+        if not 0 <= nodo <= 3:
+            raise HTTPException(status_code=400, detail="El nodo debe estar entre 0 y 3")
+        
+        if payload:
+            horas = payload.get("hours_to_predict", 168)
+            graficar = payload.get("include_graph", False)
+        else:
+            horas = days * 24
+            graficar = False
+        
+        # Obtener predicciones para todas las variables
+        campos = ['temperaturaBME', 'humedadAire', 'lluvia', 'humedadSuelo']
+        resultados = {}
+        
+        for campo in campos:
+            try:
+                resultado = predecir_campo(campo, horas, graficar, nodo)
+                resultados[campo] = resultado
+            except Exception as e:
+                logger.error(f"Error prediciendo {campo} para nodo {nodo}: {e}")
+                resultados[campo] = {"error": str(e)}
+        
+        return {
+            "nodo": nodo,
+            "predicciones": resultados,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error en predict_node_all para nodo {nodo}: {e}")
         raise
 
 # Función para generar alertas y recomendaciones basadas en predicciones

@@ -383,6 +383,18 @@ CACHE_DURATION = 300  # 5 minutos
 | GET | `/validate-model/{campo}` | Validación de precisión del modelo |
 | GET | `/model-metrics` | Métricas de rendimiento |
 
+### **Nuevos Endpoints para Predicciones por Nodo**
+
+| Método | Endpoint | Descripción |
+|--------|----------|-------------|
+| GET | `/predictions/node/{nodo}/temperature` | Predicción de temperatura por nodo |
+| GET | `/predictions/node/{nodo}/humidity` | Predicción de humedad por nodo |
+| GET | `/predictions/node/{nodo}/rainfall` | Predicción de lluvia por nodo |
+| GET | `/predictions/node/{nodo}/soil-moisture` | Predicción de humedad del suelo por nodo |
+| GET | `/predictions/node/{nodo}/all` | Todas las predicciones para un nodo |
+
+**Nota**: `{nodo}` debe ser un valor entre 0 y 3, representando los 4 nodos del sistema.
+
 ---
 
 ## **Conclusiones para la Defensa**
