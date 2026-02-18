@@ -2,3 +2,4 @@ msa-venv/
 .venv/*
 datos.env
 __pycache__/
+apps/__pycache__/
