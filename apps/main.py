@@ -43,7 +43,11 @@ app = FastAPI()
 # Configuración de CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Cambia esto a tu dominio en producción
+    # Orígenes explícitos: con cookies (Cloudflare Access) el navegador rechaza "*".
+    # Se pueden cambiar con CORS_ORIGINS="https://a.com,https://b.com" en datos.env.
+    allow_origins=[o.strip() for o in os.getenv(
+        "CORS_ORIGINS", "https://msafront.jipixz.com,http://localhost:5173,http://localhost:3000"
+    ).split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
