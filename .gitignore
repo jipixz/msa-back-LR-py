@@ -3,3 +3,4 @@ msa-venv/
 datos.env
 __pycache__/
 apps/__pycache__/
+*.bak

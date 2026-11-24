@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import time
+import threading
 from functools import lru_cache
 from datetime import datetime, timedelta
 
@@ -26,6 +27,13 @@ logger = logging.getLogger(__name__)
 # Cache para predicciones (5 minutos)
 prediction_cache = {}
 CACHE_DURATION = 300  # 5 minutos en segundos
+
+# Cache de los datos crudos de MongoDB: evita volver a leer decenas de miles
+# de documentos en cada petición (antes /get_datos tardaba ~35 s).
+DATOS_CACHE_SECONDS = int(os.getenv("DATOS_CACHE_SECONDS", 300))
+_datos_cache = {}  # nodo -> (timestamp, DataFrame con _id)
+_datos_lock = threading.Lock()
+_mongo_client = None
 
 # Cargar variables desde datos.env
 load_dotenv("./datos.env")
@@ -55,6 +63,23 @@ class EntradaPrediccionNodo(BaseModel):
 
 # Función para conectarse y obtener los datos
 def obtener_datos(eliminar_id=True, nodo=None):
+    """Devuelve los datos de sensores, reutilizando una copia en cache por
+    DATOS_CACHE_SECONDS para no consultar MongoDB en cada petición."""
+    with _datos_lock:
+        cached = _datos_cache.get(nodo)
+        if cached and time.time() - cached[0] < DATOS_CACHE_SECONDS:
+            df = cached[1].copy()
+        else:
+            df = _leer_datos_mongo(nodo)
+            _datos_cache[nodo] = (time.time(), df.copy())
+
+    if eliminar_id and "_id" in df.columns:
+        df.drop(columns=["_id"], inplace=True)
+    return df
+
+
+def _leer_datos_mongo(nodo=None):
+    global _mongo_client
     try:
         # Configuración para conexión local
         mongo_host = os.getenv("MONGO_HOST", "localhost")
@@ -71,13 +96,14 @@ def obtener_datos(eliminar_id=True, nodo=None):
         if not all([mongo_db, mongo_collection]):
             raise ValueError("Faltan variables de entorno necesarias.")
 
-        # Conexión local a MongoDB con autenticación opcional
-        if mongo_user and mongo_password:
-            # Conexión con credenciales
-            client = MongoClient(f"mongodb://{mongo_user}:{mongo_password}@{mongo_host}:{mongo_port}/{mongo_auth_db}")
-        else:
-            # Conexión sin credenciales
-            client = MongoClient(f"mongodb://{mongo_host}:{mongo_port}")
+        # Conexión local a MongoDB con autenticación opcional.
+        # Se reutiliza un solo cliente (antes se abría uno nuevo por petición y nunca se cerraba).
+        if _mongo_client is None:
+            if mongo_user and mongo_password:
+                _mongo_client = MongoClient(f"mongodb://{mongo_user}:{mongo_password}@{mongo_host}:{mongo_port}/{mongo_auth_db}")
+            else:
+                _mongo_client = MongoClient(f"mongodb://{mongo_host}:{mongo_port}")
+        client = _mongo_client
 
         db = client[mongo_db]
         collection = db[mongo_collection]
@@ -109,12 +135,7 @@ def obtener_datos(eliminar_id=True, nodo=None):
                 campos_disponibles.update(doc.keys())
             logger.info(f"Campos disponibles en los datos: {list(campos_disponibles)}")
 
-        df = pd.DataFrame(datos)
-
-        if eliminar_id and "_id" in df.columns:
-            df.drop(columns=["_id"], inplace=True)
-
-        return df
+        return pd.DataFrame(datos)
 
         # Código SSH comentado para uso futuro
         # with SSHTunnelForwarder(
@@ -323,10 +344,12 @@ def dataframe_to_json_safe(df):
 
 # --- Ruta GET para obtener datos con _id como str ---
 @app.get("/get_datos")
-def get_datos():
+def get_datos(limite: int | None = Query(None, ge=1, description="Devolver solo los N registros más recientes")):
     try:
         # Aquí no eliminamos _id
         df = obtener_datos(eliminar_id=False)
+        if limite is not None:
+            df = df.head(limite)  # los datos vienen ordenados del más reciente al más antiguo
         if df.empty:
             raise HTTPException(status_code=404, detail="No se encontraron datos.")
         
