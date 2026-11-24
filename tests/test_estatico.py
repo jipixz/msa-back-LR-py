@@ -18,8 +18,8 @@ def test_main_compila():
     _arbol()
 
 
-@pytest.mark.xfail(reason="generar_alertas_recomendaciones está definida dos veces; la primera es código muerto", strict=True)
 def test_sin_funciones_duplicadas():
+    # Decisión: una definición repetida deja código muerto (pasó con generar_alertas_recomendaciones)
     nombres = Counter(n.name for n in _arbol().body if isinstance(n, ast.FunctionDef))
     duplicadas = [k for k, v in nombres.items() if v > 1]
     assert duplicadas == []
