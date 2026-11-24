@@ -14,6 +14,8 @@ import io
 import base64
 import matplotlib.pyplot as plt
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from urllib.parse import urlparse
 import logging
 import time
 import threading
@@ -40,18 +42,38 @@ load_dotenv("./datos.env")
 
 app = FastAPI()
 
+# Orígenes explícitos: con cookies (Cloudflare Access) el navegador rechaza "*".
+# Se pueden cambiar con CORS_ORIGINS="https://a.com,https://b.com" en datos.env.
+CORS_ORIGINS = [o.strip() for o in os.getenv(
+    "CORS_ORIGINS", "https://msafront.jipixz.com,http://localhost:5173,http://localhost:3000"
+).split(",") if o.strip()]
+
 # Configuración de CORS
 app.add_middleware(
     CORSMiddleware,
-    # Orígenes explícitos: con cookies (Cloudflare Access) el navegador rechaza "*".
-    # Se pueden cambiar con CORS_ORIGINS="https://a.com,https://b.com" en datos.env.
-    allow_origins=[o.strip() for o in os.getenv(
-        "CORS_ORIGINS", "https://msafront.jipixz.com,http://localhost:5173,http://localhost:3000"
-    ).split(",") if o.strip()],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Cloudflare Access: cuando la cookie de este host expira, el front no puede renovarla con
+# fetch (CORS bloquea el redirect al login). Entonces navega la pestaña a /access/return;
+# Access renueva la cookie (o pide login) y aquí regresamos al front.
+# Solo se redirige a los orígenes de CORS_ORIGINS para no ser un open redirect.
+@app.get("/access/ping")
+def access_ping():
+    return {"ok": True}
+
+
+@app.get("/access/return")
+def access_return(to: str = ""):
+    destino = urlparse(to)
+    origen = f"{destino.scheme}://{destino.netloc}"
+    if destino.scheme in ("http", "https") and origen in CORS_ORIGINS:
+        return RedirectResponse(to, status_code=302)
+    return RedirectResponse(CORS_ORIGINS[0] if CORS_ORIGINS else "/", status_code=302)
 
 # Modelo para entrada de predicción, agregamos opción para graficar y nodo
 class EntradaPrediccion(BaseModel):
